@@ -816,3 +816,134 @@ def gemm_naive(M, N, K, bx=32, by=8, swap=False):
         grid,
     )
 
+# Step 7 - gemm_smem
+def gemm_smem(M, N, K, T=16):
+    # The shared-memory tiling scheme requires all problem dimensions
+    # to be exact multiples of the tile size.
+    assert M % T == 0 and N % T == 0 and K % T == 0
+
+    C = param("C", dtypes.float32, 0)
+    A = param("A", dtypes.float32, 1)
+    B = param("B", dtypes.float32, 2)
+
+    # CUDA thread and block indices.
+    tx = special("threadIdx.x")
+    ty = special("threadIdx.y")
+    bxid = special("blockIdx.x")
+    byid = special("blockIdx.y")
+
+    # Each thread computes one output element of the T x T tile.
+    i = byid * T + ty
+    j = bxid * T + tx
+
+    # Shared-memory tiles for A and B.
+    As = local("As", dtypes.float32, T * T)
+    Bs = local("Bs", dtypes.float32, T * T)
+
+    # Accumulator for the output element.
+    acc = acc_(dtypes.float32, 0)
+
+    # Outer reduction iterates over K/T tiles.
+    rt = rng_(K // T, 0)
+
+    # Inner reduction iterates over the T values within a tile.
+    rk = rng_(T, 1)
+
+    # ---------------------------------------------------------------
+    # Cooperative load of the A tile into shared memory:
+    #
+    #   As[ty * T + tx] = A[i * K + rt * T + tx]
+    # ---------------------------------------------------------------
+    a_idx = i * K + rt * T + tx
+    as_idx = ty * T + tx
+    a_val = load(A, a_idx)
+
+    store_a = (
+        "localstore",
+        As,
+        as_idx,
+        a_val,
+        None,
+    )
+
+    # ---------------------------------------------------------------
+    # Cooperative load of the B tile into shared memory:
+    #
+    #   Bs[ty * T + tx] = B[(rt * T + ty) * N + j]
+    # ---------------------------------------------------------------
+    b_idx = (rt * T + ty) * N + j
+    bs_idx = ty * T + tx
+    b_val = load(B, b_idx)
+
+    store_b = (
+        "localstore",
+        Bs,
+        bs_idx,
+        b_val,
+        None,
+    )
+
+    # ---------------------------------------------------------------
+    # Inner reduction over the current shared-memory tile:
+    #
+    #   acc += As[ty * T + rk] * Bs[rk * T + tx]
+    # ---------------------------------------------------------------
+    inner_a_idx = ty * T + rk
+    inner_b_idx = rk * T + tx
+
+    inner_a = load(As, inner_a_idx)
+    inner_b = load(Bs, inner_b_idx)
+
+    inner_update = acc + inner_a * inner_b
+
+    inner = Reduce(
+        [rk],
+        [[
+            acc,
+            acc,
+            inner_update,
+        ]],
+    )
+
+    # ---------------------------------------------------------------
+    # Outer tiled reduction.
+    #
+    # The initializer 0.0 is used once, while the update is 'acc',
+    # meaning the accumulator is carried across tiles. The inner
+    # reduction performs the actual multiply-accumulate work.
+    # ---------------------------------------------------------------
+    outer = Reduce(
+        [rt],
+        [[
+            acc,
+            UOp.const(dtypes.float32, 0.0),
+            acc,
+        ]],
+        [
+            store_a,
+            store_b,
+            "__syncthreads();",
+            inner,
+            "__syncthreads();",
+        ],
+    )
+
+    # Final output location for this thread.
+    output_idx = i * N + j
+
+    return Kernel(
+        f"gemm_smem{T}",
+        [C, A, B],
+        [
+            ("tx", "threadIdx.x"),
+            ("ty", "threadIdx.y"),
+            ("bxid", "blockIdx.x"),
+            ("byid", "blockIdx.y"),
+        ],
+        [outer],
+        [(output_idx, acc, None)],
+        (T, T),
+        (N // T, M // T),
+        locals_=[As, Bs],
+    )
+
