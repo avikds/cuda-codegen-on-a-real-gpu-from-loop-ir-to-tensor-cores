@@ -947,3 +947,242 @@ def gemm_smem(M, N, K, T=16):
         locals_=[As, Bs],
     )
 
+# Step 8 - gemm_regtile
+def gemm_regtile(M, N, K, BM=64, BN=64, BK=8, TM=4, TN=4):
+    # The block tile must cover the output dimensions exactly, and each
+    # thread must own an integral TM x TN micro-tile.
+    assert M % BM == 0
+    assert N % BN == 0
+    assert K % BK == 0
+    assert BM % TM == 0
+    assert BN % TN == 0
+
+    C = param("C", dtypes.float32, 0)
+    A = param("A", dtypes.float32, 1)
+    B = param("B", dtypes.float32, 2)
+
+    # One-dimensional block of threads.
+    tid = special("threadIdx.x")
+    bxid = special("blockIdx.x")
+    byid = special("blockIdx.y")
+
+    threads = (BM // TM) * (BN // TN)
+    micro_cols = BN // TN
+
+    # Each thread owns one TM x TN micro-tile.
+    trow = tid // micro_cols
+    tcol = tid % micro_cols
+
+    # Shared-memory tiles.
+    As = local("As", dtypes.float32, BM * BK)
+    Bs = local("Bs", dtypes.float32, BK * BN)
+
+    # ---------------------------------------------------------------
+    # One accumulator for every output element in this thread's
+    # TM x TN micro-tile.
+    #
+    # ID convention required by the specification:
+    #   acc_(dtypes.float32, 10 + a * TN + b)
+    # ---------------------------------------------------------------
+    accs = []
+
+    for a in range(TM):
+        for b in range(TN):
+            acc = acc_(dtypes.float32, 10 + a * TN + b)
+            accs.append([
+                acc,
+                UOp.const(dtypes.float32, 0.0),
+                acc,
+            ])
+
+    # ---------------------------------------------------------------
+    # Outer reduction over K/BK shared-memory tiles.
+    # ---------------------------------------------------------------
+    rt = rng_(K // BK, 0)
+
+    body = []
+
+    # ---------------------------------------------------------------
+    # Cooperative loading of A into shared memory.
+    #
+    # For each cooperative chunk:
+    #
+    #   idx = tid + e
+    #
+    # A source:
+    #
+    #   A[
+    #       (byid * BM + idx / BK) * K
+    #       + rt * BK
+    #       + idx % BK
+    #   ]
+    #
+    # Destination:
+    #
+    #   As[idx]
+    # ---------------------------------------------------------------
+    for e in range(0, BM * BK, threads):
+        idx = tid + e
+
+        a_idx = (
+            (byid * BM + idx // BK) * K
+            + rt * BK
+            + idx % BK
+        )
+
+        a_val = load(A, a_idx)
+
+        if BM * BK % threads != 0:
+            cond = idx < BM * BK
+        else:
+            cond = None
+
+        body.append(
+            (
+                "localstore",
+                As,
+                idx,
+                a_val,
+                cond,
+            )
+        )
+
+    # ---------------------------------------------------------------
+    # Cooperative loading of B into shared memory.
+    #
+    # Source:
+    #
+    #   B[
+    #       (rt * BK + idx / BN) * N
+    #       + bxid * BN
+    #       + idx % BN
+    #   ]
+    #
+    # Destination:
+    #
+    #   Bs[idx]
+    # ---------------------------------------------------------------
+    for e in range(0, BK * BN, threads):
+        idx = tid + e
+
+        b_idx = (
+            (rt * BK + idx // BN) * N
+            + bxid * BN
+            + idx % BN
+        )
+
+        b_val = load(B, b_idx)
+
+        if BK * BN % threads != 0:
+            cond = idx < BK * BN
+        else:
+            cond = None
+
+        body.append(
+            (
+                "localstore",
+                Bs,
+                idx,
+                b_val,
+                cond,
+            )
+        )
+
+    # All threads must finish populating shared memory before any
+    # thread begins consuming the tile.
+    body.append("__syncthreads();")
+
+    # ---------------------------------------------------------------
+    # Inner reduction over BK.
+    #
+    # Each accumulator corresponds to one element of the thread's
+    # TM x TN micro-tile.
+    # ---------------------------------------------------------------
+    rk = rng_(BK, 1)
+
+    inner_accs = []
+
+    for a in range(TM):
+        for b in range(TN):
+            acc_id = 10 + a * TN + b
+            acc = acc_(dtypes.float32, acc_id)
+
+            as_idx = (
+                (trow * TM + a) * BK
+                + rk
+            )
+
+            bs_idx = (
+                rk * BN
+                + tcol * TN
+                + b
+            )
+
+            as_val = load(As, as_idx)
+            bs_val = load(Bs, bs_idx)
+
+            update = acc + as_val * bs_val
+
+            inner_accs.append([
+                acc,
+                acc,
+                update,
+            ])
+
+    inner = Reduce(
+        [rk],
+        inner_accs,
+    )
+
+    body.append(inner)
+
+    # Ensure all threads have finished reading the current shared-memory
+    # tile before another outer tile overwrites it.
+    body.append("__syncthreads();")
+
+    outer = Reduce(
+        [rt],
+        accs,
+        body,
+    )
+
+    # ---------------------------------------------------------------
+    # Store the complete TM x TN register micro-tile to C.
+    # ---------------------------------------------------------------
+    stores = []
+
+    for a in range(TM):
+        for b in range(TN):
+            acc_id = 10 + a * TN + b
+            acc = acc_(dtypes.float32, acc_id)
+
+            output_idx = (
+                (byid * BM + trow * TM + a) * N
+                + bxid * BN
+                + tcol * TN
+                + b
+            )
+
+            stores.append(
+                (
+                    output_idx,
+                    acc,
+                    None,
+                )
+            )
+
+    return Kernel(
+        f"gemm_reg{BM}x{BN}x{BK}_{TM}x{TN}",
+        [C, A, B],
+        [
+            ("tid", "threadIdx.x"),
+            ("bxid", "blockIdx.x"),
+            ("byid", "blockIdx.y"),
+        ],
+        [outer],
+        stores,
+        (threads, 1),
+        (N // BN, M // BM),
+        locals_=[As, Bs],
+    )
+
