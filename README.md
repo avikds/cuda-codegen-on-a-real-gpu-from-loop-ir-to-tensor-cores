@@ -18,6 +18,7 @@ python scaffold.py
 - [x] **6.** gemm_naive
 - [x] **7.** gemm_smem
 - [x] **8.** gemm_regtile
+- [x] **9.** gemm_wmma
 
 ---
 
