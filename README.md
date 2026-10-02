@@ -11,6 +11,7 @@ python scaffold.py
 ## Steps
 
 - [x] **1.** UOp
+- [x] **2.** Renderer
 
 ---
 
