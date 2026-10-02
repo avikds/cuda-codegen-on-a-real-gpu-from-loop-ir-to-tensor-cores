@@ -260,9 +260,11 @@ def local(name, dtype, size):
 import math
 
 def c_lit(dtype, v):
+    # Integer-like dtypes are emitted as C integer literals.
     if dtype.c == "int":
         return str(int(v))
 
+    # Floating-point values are emitted with the CUDA float suffix.
     fv = float(v)
 
     if math.isinf(fv):
@@ -281,43 +283,49 @@ class Renderer:
         self.scopes.append({})
 
     def pop(self):
-        return self.scopes.pop()
+        self.scopes.pop()
 
     def emit(self, s):
+        # Two spaces of indentation for each currently open scope.
         self.lines.append("  " * len(self.scopes) + s)
 
     def var(self, u, e):
         name = f"v{self.n}"
         self.n += 1
+
         self.emit(f"{u.dtype.c} {name} = {e};")
         self.scopes[-1][u] = name
+
         return name
 
     def expr(self, u):
-        # Reuse an already-rendered expression from the nearest scope.
+        # Common-subexpression elimination:
+        # search from the innermost active scope outward.
         for scope in reversed(self.scopes):
             if u in scope:
                 return scope[u]
 
-        # Constants are emitted inline.
+        # Constants are emitted directly instead of as temporaries.
         if u.op is Ops.CONST:
             return c_lit(u.dtype, u.arg)
 
-        # RANGE and SPECIAL correspond directly to CUDA/index expressions.
+        # Loop ranges map to symbolic range variables.
         if u.op is Ops.RANGE:
             return f"r{u.arg}"
 
+        # CUDA special indices such as threadIdx.x or blockIdx.x.
         if u.op is Ops.SPECIAL:
             return u.arg
 
-        # Accumulators are represented by their fixed symbolic names.
+        # Accumulators have fixed symbolic names.
         if u.op is Ops.DEFINE_ACC:
             return f"acc{u.arg}"
 
-        # LOAD(INDEX(base, idx)).
+        # Loads are materialized as temporaries.
         if u.op is Ops.LOAD:
             index = u.src[0]
             p, idx = index.src
+
             idx_expr = self.expr(idx)
 
             if p.op is Ops.PARAM:
@@ -332,12 +340,17 @@ class Renderer:
         # Conditional expression.
         if u.op is Ops.WHERE:
             cond, a, b = u.src
+
+            cond_expr = self.expr(cond)
+            a_expr = self.expr(a)
+            b_expr = self.expr(b)
+
             return self.var(
                 u,
-                f"({self.expr(cond)} ? {self.expr(a)} : {self.expr(b)})",
+                f"({cond_expr} ? {a_expr} : {b_expr})",
             )
 
-        # Unary floating-point operations.
+        # Unary operations.
         if u.op is Ops.RECIP:
             x = self.expr(u.src[0])
             return self.var(u, f"(1.0f/{x})")
@@ -350,7 +363,7 @@ class Renderer:
             x = self.expr(u.src[0])
             return self.var(u, f"sqrtf({x})")
 
-        # MAX uses fmaxf for floating-point expressions and max otherwise.
+        # Maximum uses the floating-point CUDA intrinsic for float values.
         if u.op is Ops.MAX:
             a = self.expr(u.src[0])
             b = self.expr(u.src[1])
