@@ -401,3 +401,61 @@ class Renderer:
 
         raise ValueError(f"Unsupported UOp in CUDA renderer: {u.op}")
 
+# Step 3 - Kernel
+class Reduce:
+    def __init__(self, ranges, accs, body=()):
+        # Nested loop ranges.
+        self.ranges = list(ranges)
+
+        # Each accumulator is represented as [acc, init, update].
+        #
+        # When init is the same UOp as acc, the accumulator carries its
+        # current value into this staged/nested reduction.
+        self.accs = [list(acc) for acc in accs]
+
+        # Statements executed inside the innermost loop before accumulator
+        # updates. These may be:
+        #   - nested Reduce objects
+        #   - raw CUDA source strings
+        #   - ("localstore", local_buf, index, value, cond) tuples
+        self.body = list(body)
+
+
+class Kernel:
+    def __init__(
+        self,
+        name,
+        params,
+        specials,
+        body,
+        stores,
+        block,
+        grid,
+        locals_=(),
+        tiles=(),
+    ):
+        self.name = name
+        self.params = list(params)
+
+        # Kernel-level special index definitions.
+        # Each entry is (name, CUDA expression string).
+        self.specials = list(specials)
+
+        # Structured kernel body.
+        self.body = list(body)
+
+        # Output stores are (index, value, cond) triples.
+        self.stores = [tuple(store) for store in stores]
+
+        # CUDA launch configuration.
+        self.block = tuple(block)
+        self.grid = tuple(grid)
+
+        # Shared-memory buffers.
+        # The public attribute is intentionally named 'locals' because that
+        # is the interface used by the later renderer/tests.
+        self.locals = list(locals_)
+
+        # Optional tile metadata used by later optimization stages.
+        self.tiles = list(tiles)
+
