@@ -735,3 +735,84 @@ def bench(lib, name, tensors, flops, reps=10):
     # Convert operations/second to GFLOP/s.
     return (flops * reps) / elapsed / 1e9
 
+# Step 6 - gemm_naive
+def gemm_naive(M, N, K, bx=32, by=8, swap=False):
+    # Output, left input, and right input parameters occupy positions
+    # 0, 1, and 2 respectively.
+    C = param("C", dtypes.float32, 0)
+    A = param("A", dtypes.float32, 1)
+    B = param("B", dtypes.float32, 2)
+
+    # CUDA thread/block coordinates.
+    gidx0 = special("gidx0")
+    gidx1 = special("gidx1")
+
+    # In the normal mapping:
+    #   j (column) = gidx0
+    #   i (row)    = gidx1
+    #
+    # With swap=True, the two logical output axes are exchanged.
+    if swap:
+        i = gidx0
+        j = gidx1
+        name = "gemm_naive_swap"
+        grid = (
+            (M + bx - 1) // bx,
+            (N + by - 1) // by,
+        )
+    else:
+        i = gidx1
+        j = gidx0
+        name = "gemm_naive"
+        grid = (
+            (N + bx - 1) // bx,
+            (M + by - 1) // by,
+        )
+
+    # Reduction index over the K dimension.
+    k = rng_(K, 0)
+
+    # One accumulator per output element:
+    #
+    #   C[i, j] = sum_k A[i, k] * B[k, j]
+    #
+    # Row-major addressing:
+    #   A[i * K + k]
+    #   B[k * N + j]
+    acc = acc_(dtypes.float32, 0)
+
+    a_idx = i * K + k
+    b_idx = k * N + j
+
+    a_val = load(A, a_idx)
+    b_val = load(B, b_idx)
+
+    product = a_val * b_val
+    update = acc + product
+
+    reduction = Reduce(
+        [k],
+        [[
+            acc,
+            UOp.const(dtypes.float32, 0.0),
+            update,
+        ]],
+    )
+
+    # Store only valid output elements.
+    guard = (i < M) & (j < N)
+    output_idx = i * N + j
+
+    return Kernel(
+        name,
+        [C, A, B],
+        [
+            ("gidx0", "blockIdx.x * blockDim.x + threadIdx.x"),
+            ("gidx1", "blockIdx.y * blockDim.y + threadIdx.y"),
+        ],
+        [reduction],
+        [(output_idx, acc, guard)],
+        (bx, by),
+        grid,
+    )
+

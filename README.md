@@ -15,6 +15,7 @@ python scaffold.py
 - [x] **3.** Kernel
 - [x] **4.** render_kernel
 - [x] **5.** compile_cuda
+- [x] **6.** gemm_naive
 
 ---
 
