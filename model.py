@@ -634,3 +634,104 @@ def render_kernel(k):
         f"}}\n"
     )
 
+# Step 5 - compile_cuda
+import subprocess
+import ctypes
+import tempfile
+import os
+import hashlib
+import time
+import torch
+
+
+HEADER = """#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <math.h>
+using namespace nvcuda;
+"""
+
+
+_LIBS = {}
+
+
+def compile_cuda(src, arch="sm_75"):
+    # Cache compiled libraries using the SHA-1 of the CUDA source.
+    key = hashlib.sha1(src.encode("utf-8")).hexdigest()
+
+    if key in _LIBS:
+        return _LIBS[key]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cu_path = os.path.join(tmpdir, "kernel.cu")
+        so_path = os.path.join(tmpdir, "kernel.so")
+
+        full_src = HEADER + src
+
+        with open(cu_path, "w", encoding="utf-8") as f:
+            f.write(full_src)
+
+        cmd = [
+            "nvcc",
+            "-O3",
+            f"-arch={arch}",
+            "-shared",
+            "-Xcompiler",
+            "-fPIC",
+            "-w",
+            cu_path,
+            "-o",
+            so_path,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+
+        lib = ctypes.CDLL(so_path)
+
+        # The shared object remains loadable after the temporary directory
+        # is removed because the dynamic library has already been loaded.
+        _LIBS[key] = lib
+        return lib
+
+
+def run(lib, name, tensors):
+    launch = getattr(lib, f"launch_{name}")
+
+    # Every kernel argument is a raw device pointer.
+    launch.argtypes = [ctypes.c_void_p] * len(tensors)
+    launch.restype = None
+
+    args = [
+        ctypes.c_void_p(tensor.data_ptr())
+        for tensor in tensors
+    ]
+
+    launch(*args)
+
+
+def bench(lib, name, tensors, flops, reps=10):
+    # Warm up once before measuring to avoid including one-time CUDA/module
+    # initialization costs in the benchmark.
+    run(lib, name, tensors)
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+
+    for _ in range(reps):
+        run(lib, name, tensors)
+
+    torch.cuda.synchronize()
+
+    elapsed = time.perf_counter() - start
+
+    # Convert operations/second to GFLOP/s.
+    return (flops * reps) / elapsed / 1e9
+

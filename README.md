@@ -14,6 +14,7 @@ python scaffold.py
 - [x] **2.** Renderer
 - [x] **3.** Kernel
 - [x] **4.** render_kernel
+- [x] **5.** compile_cuda
 
 ---
 
