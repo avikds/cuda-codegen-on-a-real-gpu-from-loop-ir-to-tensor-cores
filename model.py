@@ -1247,3 +1247,35 @@ extern "C" void launch_gemm_wmma(float* data0, const __half* data1, const __half
 }}
 """
 
+# Step 10 - with_epilogue
+def with_epilogue(k, fn, extra_params=()):
+    # Apply the epilogue to every output store without modifying the
+    # original Kernel object.
+    new_stores = []
+
+    for idx, value, cond in k.stores:
+        new_value = fn(value, idx)
+        new_stores.append((idx, new_value, cond))
+
+    # Preserve all existing kernel properties and append any additional
+    # parameter UOps after the parameters already present.
+    new_params = list(k.params) + list(extra_params)
+
+    return Kernel(
+        k.name,
+        new_params,
+        list(k.specials),
+        list(k.body),
+        new_stores,
+        k.block,
+        k.grid,
+        locals_=list(k.locals),
+        tiles=list(k.tiles),
+    )
+
+
+def bias_relu(bias, N):
+    return lambda v, idx: (
+        v + load(bias, idx % N)
+    ).maximum(0.0)
+

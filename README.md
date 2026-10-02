@@ -19,6 +19,7 @@ python scaffold.py
 - [x] **7.** gemm_smem
 - [x] **8.** gemm_regtile
 - [x] **9.** gemm_wmma
+- [x] **10.** with_epilogue
 
 ---
 
