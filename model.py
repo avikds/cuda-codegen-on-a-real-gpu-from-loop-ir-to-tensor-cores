@@ -1279,3 +1279,152 @@ def bias_relu(bias, N):
         v + load(bias, idx % N)
     ).maximum(0.0)
 
+# Step 11 - benchmark_ladder
+def benchmark_ladder(n=1024, reps=10):
+    torch.manual_seed(0)
+
+    # Float32 inputs used by the CUDA C kernels and cuBLAS.
+    A = torch.randn(n, n, device="cuda", dtype=torch.float32)
+    B = torch.randn(n, n, device="cuda", dtype=torch.float32)
+
+    # Reference result from PyTorch/cuBLAS.
+    flops = 2 * n * n * n
+
+    # ---------------------------------------------------------------
+    # cuBLAS baseline.
+    # ---------------------------------------------------------------
+    A @ B
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+
+    for _ in range(reps):
+        A @ B
+
+    torch.cuda.synchronize()
+
+    elapsed = time.perf_counter() - start
+    cublas_gflops = (flops * reps) / elapsed / 1e9
+
+    reference = A @ B
+
+    rows = [
+        ("cublas", cublas_gflops, 0.0)
+    ]
+
+    # ---------------------------------------------------------------
+    # Helper for compiling, running, benchmarking, and checking one
+    # generated float32 kernel.
+    # ---------------------------------------------------------------
+    def benchmark_float_kernel(k):
+        src = render_kernel(k)
+        lib = compile_cuda(src)
+
+        C = torch.zeros(
+            n,
+            n,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        gflops = bench(
+            lib,
+            k.name,
+            [C, A, B],
+            flops,
+            reps,
+        )
+
+        torch.cuda.synchronize()
+
+        max_abs_err = float(
+            (C - reference).abs().max().item()
+        )
+
+        rows.append(
+            (k.name, gflops, max_abs_err)
+        )
+
+    # ---------------------------------------------------------------
+    # Naive GEMM with swapped mapping first.
+    # ---------------------------------------------------------------
+    benchmark_float_kernel(
+        gemm_naive(n, n, n, swap=True)
+    )
+
+    # Normal naive GEMM.
+    benchmark_float_kernel(
+        gemm_naive(n, n, n)
+    )
+
+    # Shared-memory tiled GEMM, 16x16.
+    benchmark_float_kernel(
+        gemm_smem(n, n, n, T=16)
+    )
+
+    # Shared-memory tiled GEMM, 32x32.
+    benchmark_float_kernel(
+        gemm_smem(n, n, n, T=32)
+    )
+
+    # Register-tiled GEMM using the default 64x64x8 / 4x4 configuration.
+    benchmark_float_kernel(
+        gemm_regtile(n, n, n)
+    )
+
+    # Larger register tile with an 8x8 per-thread micro-tile.
+    benchmark_float_kernel(
+        gemm_regtile(
+            n,
+            n,
+            n,
+            128,
+            128,
+            8,
+            8,
+            8,
+        )
+    )
+
+    # ---------------------------------------------------------------
+    # WMMA / Tensor Core GEMM.
+    #
+    # The WMMA kernel consumes half-precision inputs, so its reference
+    # is computed from the same half-precision operands converted back
+    # to float32 for comparison.
+    # ---------------------------------------------------------------
+    A_half = A.half()
+    B_half = B.half()
+
+    wmma_reference = A_half.float() @ B_half.float()
+
+    wmma_src = gemm_wmma(n, n, n)
+    wmma_lib = compile_cuda(wmma_src)
+
+    C_wmma = torch.zeros(
+        n,
+        n,
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    wmma_gflops = bench(
+        wmma_lib,
+        "gemm_wmma",
+        [C_wmma, A_half, B_half],
+        flops,
+        reps,
+    )
+
+    torch.cuda.synchronize()
+
+    wmma_max_abs_err = float(
+        (C_wmma - wmma_reference).abs().max().item()
+    )
+
+    rows.append(
+        ("gemm_wmma", wmma_gflops, wmma_max_abs_err)
+    )
+
+    return rows
+

@@ -20,6 +20,7 @@ python scaffold.py
 - [x] **8.** gemm_regtile
 - [x] **9.** gemm_wmma
 - [x] **10.** with_epilogue
+- [x] **11.** benchmark_ladder
 
 ---
 
